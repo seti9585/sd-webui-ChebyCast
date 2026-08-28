@@ -1,0 +1,33 @@
+sd-webui-ChebyCast
+Third-Party Notices
+===================
+
+Spectrum
+--------
+ChebyCast is inspired by the method described in:
+
+    Adaptive Spectral Feature Forecasting for Diffusion Sampling Acceleration
+    Jiaqi Han, Juntong Shi, Puheng Li, Haotian Ye, Qiushan Guo, Stefano Ermon
+    CVPR 2026 / arXiv:2603.01623
+    https://github.com/hanjq17/Spectrum
+
+The official Spectrum implementation is distributed under the MIT License:
+
+    MIT License
+    Copyright (c) 2026 Jiaqi Han
+
+ChebyCast is not an official Spectrum port and is not intended to reproduce
+the official implementation faithfully. It independently adapts the spectral
+forecasting idea to Forge-derived Stable Diffusion WebUIs and changes execution
+semantics for solver-step-aware and fixed-step multi-stage sampling.
+
+Community implementations
+-------------------------
+The following public implementations were consulted as integration references:
+
+    https://github.com/hirorohi03/sd-webui-forge-spectrum
+    https://github.com/hirorohi03/sd-forge-spectrum-faithful
+    https://github.com/ruwwww/comfyui-spectrum-sdxl
+    https://github.com/judian17/ComfyUI-Spectrum
+
+No claim of affiliation or endorsement is made.
