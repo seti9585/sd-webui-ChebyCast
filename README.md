@@ -2,32 +2,27 @@
 
 **EN** | [日本語](#日本語)
 
-Chebyshev-based feature forecasting for faster diffusion sampling on Forge-derived Stable Diffusion WebUIs, designed with solver-step-aware execution and fixed-step multi-stage samplers in mind.
+ChebyCast makes image generation faster by skipping some of the model evaluations a sampler would normally perform, and filling in the gaps with a prediction instead.
 
-ChebyCast is inspired by **Spectrum** — *Adaptive Spectral Feature Forecasting for Diffusion Sampling Acceleration* (Han et al., CVPR 2026) — but it is **not a faithful port** of the official implementation.
+During sampling, the denoising model (the UNet) is called over and over, and its output changes smoothly from one step to the next. ChebyCast watches that change, fits a curve through the recent outputs, and uses the curve to predict what the model would have returned. On predicted steps the model is not run at all, which is where the time saving comes from.
 
-The project keeps the central idea of fitting denoiser features with Chebyshev bases and ridge regression, while changing the execution model for Forge wrappers, solver-step grouping, non-uniform intermediate stages, and rank-agnostic model outputs.
+The part that sets ChebyCast apart is that it understands samplers which call the model **several times inside a single sampling step**, such as the TDE and RK samplers. Most extensions of this kind assume "one model call equals one sampling step", which is not true for those samplers.
+
+ChebyCast is inspired by **Spectrum** (*Adaptive Spectral Feature Forecasting for Diffusion Sampling Acceleration*, Han et al., CVPR 2026), but it is **not a port** of the official implementation. It keeps the central idea and changes how that idea is executed inside Forge.
 
 ---
 
-## Status
+## Requirements
 
-ChebyCast is currently an early implementation intended for practical validation on Forge-derived WebUIs.
-
-The architecture targets:
+ChebyCast needs the Forge `forge_objects` backend, so it works on:
 
 - reForge
 - Stable Diffusion WebUI Forge / Forge Classic
 - Forge Neo
-- SDXL-family models
-- fixed-grid single-stage samplers
-- fixed-step multi-stage TDE / RK samplers
 
-Anima / NextDiT and flow-matching models are structurally compatible with the rank-agnostic forecasting path, but should be treated as **validation pending** until practical Forge / Forge Neo tests are completed.
+A1111 is **not supported**.
 
-Adaptive ODE methods are currently **unsupported / untested**.
-
-A1111 is not supported because ChebyCast requires the Forge `forge_objects` backend.
+It is written for SDXL-family models and for samplers that use a fixed step grid. Adaptive ODE solvers are **not supported and untested** (see [Compatibility status](#compatibility-status)).
 
 ---
 
@@ -39,15 +34,64 @@ A1111 is not supported because ChebyCast requires the Forge `forge_objects` back
 https://github.com/seti9585/sd-webui-ChebyCast
 ```
 
-Restart the WebUI after installation.
+Restart the WebUI after installing. A restart is required, not just a UI reload.
 
 ---
 
-## Why ChebyCast exists
+## Getting started
 
-Many diffusion acceleration wrappers treat every denoiser invocation as if it were a complete sampling step.
+Enable ChebyCast and generate with the default values first. The defaults are chosen to be cautious: the real model always runs for the first few steps and the last few steps, and only the middle of the sampling run is allowed to use predictions.
 
-That assumption becomes problematic with multi-stage solvers. A classical four-stage RK step can evaluate the denoiser several times inside one solver step:
+If you use a multi-stage sampler (TDE / RK with a method such as `kutta4`), leave **Stage grouping** on `auto` for the first test. Only set it to a number if the debug output shows that the step boundaries are not being detected correctly.
+
+Two things to know before you compare results:
+
+- **The output will not be pixel-identical to ChebyCast OFF, even with the same seed.** A predicted step nudges the sampling path onto a slightly different course, and that difference carries through to the end. Composition, colour and overall structure are preserved, but fine detail resolves differently. This is a property of the method, not a bug.
+- If the picture breaks down, increase **Warmup steps** and **Stop forecasting offset** first, and lower **Window size**. Those three control how much of the run is allowed to be predicted.
+
+---
+
+## Parameters
+
+### Commonly adjusted
+
+| Parameter | What it does |
+| --- | --- |
+| **Window size** | How far apart the real model calls are. A larger value skips more and runs faster, but predicts further ahead. |
+| **Warmup steps** | How many steps at the beginning always run the real model. Predictions need real samples to fit against, so this cannot be zero. |
+| **Stop forecasting offset** | How many steps at the end always run the real model. The final steps decide fine detail, so keeping them real protects image quality. |
+| **Blend weight (w)** | How much of the prediction comes from the Chebyshev fit versus the simpler local extrapolation. `0` uses only the local method, `1` uses only the Chebyshev fit. |
+| **Apply to hires pass** | Whether the hires pass also gets ChebyCast. A fresh prediction state is started for that pass. |
+
+### Advanced
+
+| Parameter | What it does |
+| --- | --- |
+| **Chebyshev bases (m)** | How many curve components are used for the fit. Higher values can follow a more complicated shape but need more real samples to stay stable. |
+| **Ridge regularization (lam)** | How strongly the fit is held back from swinging around. Higher values give a smoother, more conservative curve. |
+| **Window growth (flex)** | Widens the gap between real model calls as the run proceeds. `0` keeps the gap constant. |
+| **History points (K)** | How many past real samples are kept for fitting. |
+| **Stage grouping** | `auto` uses the WebUI sampling-step counter to find step boundaries. A number instead groups that many model calls into one step. |
+| **Fit points** | Whether every real intermediate stage feeds the fit, or only the first real point of each step. |
+| **Time coordinate** | Which axis the curve is fitted against. `auto` tries schedule, then step, then timestep, then sigma. |
+
+### A note on `m`
+
+The official Spectrum README defines `algo.m` as the **number of Chebyshev bases**, with a default of `4`. ChebyCast uses the same meaning, so `m = 4` uses the four components `T0`, `T1`, `T2` and `T3`. Internally the value is stored as `m - 1`, but nothing in the UI asks you to think in those terms.
+
+---
+
+## How it works
+
+### The basic idea
+
+The model's output over the course of a sampling run behaves like a smooth curve. If you have several points on that curve, you can fit a formula to them and read off a value at a position you have not actually computed.
+
+ChebyCast fits that curve using **Chebyshev polynomials**. Their useful property is that the approximation error stays evenly spread across the whole interval instead of piling up at one end, which is what makes them suitable for predicting some distance ahead rather than just one step. The fit itself is a least-squares fit with a regularization term (ridge regression); the **Ridge regularization (lam)** slider is the strength of that term.
+
+### Multi-stage samplers, and why ChebyCast exists
+
+Many acceleration extensions count model calls and treat each one as a sampling step. That assumption breaks with multi-stage solvers, where a single solver step evaluates the model several times:
 
 ```text
 solver step N
@@ -57,228 +101,145 @@ solver step N
   k4
 ```
 
-A raw model-call counter can incorrectly advance the forecasting state four times even though the sampler is still inside the same solver step.
+If the raw model-call count is used as the time axis, the sampler is still partway through step N while the prediction state believes four steps have already gone by. The prediction is then asked about a future that does not exist yet.
 
-ChebyCast instead separates:
+ChebyCast separates two things that other implementations conflate:
 
-```text
-solver-step forecast decision
-```
+- **the decision** of whether a solver step is real or predicted, which is made once per solver step
+- **the position on the time axis**, which each individual stage gets for itself
 
-from:
-
-```text
-stage time / sigma coordinate
-```
-
-This lets all stage evaluations belonging to one fixed-step RK/TDE solver step share one actual-or-forecast decision while still receiving their own time coordinate.
-
----
-
-## Main differences from Spectrum
-
-ChebyCast uses Spectrum as its main methodological inspiration, but intentionally differs in several areas.
-
-### Solver-step-aware execution
-
-Actual / forecast decisions are cached per solver step rather than being decided independently for each raw model call.
-
-This is intended for fixed-step multi-stage methods where one visible sampling step can contain multiple denoiser evaluations.
+So every stage inside one fixed-step RK or TDE solver step shares a single real-or-predicted decision, while still being fitted at its own place on the curve.
 
 ### Time coordinate
 
-`auto` mode tries the following coordinate sources in order:
+`auto` looks for a usable axis in this order:
 
 ```text
 schedule -> step -> timestep -> sigma
 ```
 
-The goal is to avoid using the raw model-call count as the forecasting time axis.
+The point of the ordering is to avoid ever falling back on the raw model-call count.
 
-### Local extrapolation
+### Fit points
 
-The non-spectral branch uses **Newton divided differences** instead of assuming uniform spacing.
+**all stages** lets every real intermediate stage update the fit. This gives more samples to work with, but those samples sit at uneven positions along the axis.
 
-This is intended to remain meaningful when intermediate solver stages occur at non-uniform coordinates.
-
-### Rank-agnostic buffers
-
-Wrapper outputs are flattened into float32 forecasting buffers and restored to their original shape after prediction.
-
-ChebyCast therefore does not hard-code an SDXL-style 4-D latent rank.
-
-### Independent safety clamp
-
-Forecast outputs include an independent finite-value fallback and safety clamp.
-
-This is a ChebyCast implementation detail, not a parameter from the Spectrum paper.
+**step head only** adds just the first real update of each solver step. Fewer samples, more conservative.
 
 ---
 
-## Parameters
+## Main differences from Spectrum
 
-| Parameter | Description |
+ChebyCast takes Spectrum as its starting point and deliberately departs from it in several places.
+
+| Area | ChebyCast |
 | --- | --- |
-| **Blend weight (w)** | Mixes local Newton extrapolation and the Chebyshev prediction. `0` = local only, `1` = Chebyshev only. |
-| **Chebyshev bases (m)** | Number of bases `T0 ... T(m-1)`. The default `m=4` means polynomial degree 3. |
-| **Ridge regularization (lam)** | Ridge strength used when fitting Chebyshev coefficients. |
-| **Window size** | Initial spacing of actual solver steps versus forecast steps. |
-| **Window growth (flex)** | Increases the effective window after actual steps. |
-| **History points (K)** | Maximum number of stored fit samples. |
-| **Warmup steps** | Leading solver steps that always run the real model. |
-| **Stop forecasting offset** | Trailing solver steps that always run the real model. |
-| **Stage grouping** | `auto` uses the WebUI sampling-step counter; a number groups that many model calls into one solver step. |
-| **Fit points** | Choose whether all actual intermediate stages or only the first actual point of each solver step update the fit. |
-| **Apply to hires pass** | Enables a fresh ChebyCast runtime for the hires pass. |
-| **Time coordinate** | Selects the fitting axis. `auto` prefers schedule, then step, timestep, and sigma. |
+| Execution unit | Real-or-predicted decisions are cached per solver step, not per model call |
+| Time axis | Never the raw model-call count; `auto` prefers schedule, step, timestep, sigma |
+| Local extrapolation | Newton divided differences, which stay meaningful when the sample positions are unevenly spaced |
+| Output buffers | Model outputs are flattened and restored afterwards, so no fixed latent shape is assumed |
+| Safety | An independent check for non-finite values and a clamp on predicted output |
+
+The safety check is a ChebyCast implementation detail. It is not a parameter from the Spectrum paper.
 
 ---
 
-## About `m`
+## Defaults
 
-The official Spectrum README defines `algo.m` as the **number of Chebyshev bases**, with a default of `4`.
+ChebyCast does **not** aim to reproduce Spectrum's default settings.
 
-ChebyCast follows that public meaning:
-
-```text
-m = 4
-```
-
-uses:
-
-```text
-T0, T1, T2, T3
-```
-
-which is polynomial degree 3.
-
-Internally, ChebyCast stores the polynomial degree as `m - 1`.
-
----
-
-## Defaults and Spectrum defaults
-
-ChebyCast does **not** claim to reproduce Spectrum's default parameter set.
-
-Current ChebyCast defaults are:
-
-| Parameter | ChebyCast |
+| Parameter | ChebyCast default |
 | --- | ---: |
-| `w` | 0.40 |
-| `m` | 4 bases |
-| `lam` | 1.00 |
-| initial window | 2 |
-| flex | 0.00 |
-| history | 16 |
-| warmup | 4 |
-| stop offset | 3 |
+| Blend weight (w) | 0.40 |
+| Chebyshev bases (m) | 4 |
+| Ridge regularization (lam) | 1.00 |
+| Window size | 2 |
+| Window growth (flex) | 0.00 |
+| History points (K) | 16 |
+| Warmup steps | 4 |
+| Stop forecasting offset | 3 |
 
-The current official Spectrum README documents `w=1.0`, `lam=0.1`, and `m=4` as defaults, and discusses a post-publication mixture with linear interpolation.
+The official Spectrum README currently documents `w = 1.0`, `lam = 0.1` and `m = 4`, and describes a post-publication mixture with linear interpolation.
 
-ChebyCast's `w` instead mixes the Chebyshev predictor with its own Newton-divided-difference local extrapolator. The two `w` parameters therefore should **not** be assumed to be numerically interchangeable.
+The two `w` values are **not interchangeable**. Spectrum's `w` mixes the Chebyshev prediction with a linear interpolation; ChebyCast's `w` mixes it with the Newton divided-difference extrapolator described above. The same number will not mean the same thing in both.
 
 ---
 
-## Multi-stage samplers
+## Manual stage grouping
 
-Manual stage grouping is provided for environments where the WebUI sampling-step counter does not expose the desired solver-step boundary.
-
-For example, a fixed four-stage method can be tested with:
+If the WebUI sampling-step counter does not expose the step boundary you need, you can state it yourself. For a fixed four-stage method:
 
 ```text
 Stage grouping = 4
 ```
 
-This option must not be treated as a general solution for adaptive ODE methods.
-
-Adaptive methods can perform variable stage counts, rejected steps, embedded error evaluations, and repeated model calls. A fixed grouping number cannot reconstruct those boundaries reliably.
+This is a workaround for fixed-step methods only. It is **not** a way to support adaptive ODE solvers. Adaptive methods vary their stage count, reject and retry steps, and make extra evaluations for error estimation. No single grouping number can reconstruct those boundaries.
 
 ---
 
-## Fit points
+## Compatibility with other extensions
 
-### all stages
+ChebyCast can keep an existing `model_function_wrapper` alive on **real model calls** by chaining it inside its own wrapper.
 
-Every actual intermediate stage can update the fit.
+On a **predicted call** the model evaluation is replaced by a prediction, so the inner wrapper does not run at all.
 
-This can provide more samples, but those samples may come from non-uniform stage coordinates.
-
-### step head only
-
-Only the first actual update for each solver step is added for a given forecasting key.
-
-This is a more conservative fit history.
-
----
-
-## Wrapper compatibility note
-
-ChebyCast can preserve an existing `model_function_wrapper` on **actual model calls** by chaining it inside the ChebyCast wrapper.
-
-On a **forecasted call**, the model evaluation is intentionally replaced by a prediction, so the inner wrapper is not executed.
-
-Therefore compatibility must be evaluated carefully for extensions that require their own model-function wrapper to run on every denoiser invocation.
+Any extension that needs its own wrapper to run on every single denoiser call therefore has to be checked individually before using it together with ChebyCast.
 
 ---
 
 ## Debug output
 
-Set the shared SETI debug environment variable before starting the WebUI:
+Set the shared debug variable in PowerShell before launching the WebUI:
 
 ```powershell
 $env:SD_WEBUI_SETI_DEBUG = "1"
 ```
 
-ChebyCast will report the selected time-coordinate source and an end-of-run summary.
-
-A higher debug level can be used for per-step decisions:
+Level 1 reports which time-coordinate source was selected and prints a summary at the end of the run.
 
 ```powershell
 $env:SD_WEBUI_SETI_DEBUG = "2"
 ```
 
+Level 2 additionally reports the real-or-predicted decision for each step.
+
+Output goes to both the module logger and stderr, because some backends suppress module-level logger output.
+
 ---
 
 ## Validation guidance
 
-For ON / OFF comparisons, keep these fixed:
+For an ON / OFF comparison, hold all of these fixed: model, prompt and negative prompt, seed, sampler, scheduler, steps, CFG and resolution.
 
-- model
-- prompt / negative prompt
-- seed
-- sampler
-- scheduler
-- steps
-- CFG
-- resolution
+Then check:
 
-Compare:
+- generation completes without an error
+- no NaN or Inf appears in the log
+- no severe colour corruption
+- the latent does not diverge
+- the composition does not collapse
+- the number of real model calls actually went down
+- generation time actually improved
 
-- successful completion
-- NaN / Inf
-- severe color corruption
-- latent instability
-- structure failure
-- actual denoiser-call reduction
-- generation time
-
-ChebyCast is an approximation method, so pixel-identical output is not expected.
+As noted in [Getting started](#getting-started), pixel-identical output is not the goal and should not be used as the pass criterion.
 
 ---
 
 ## Compatibility status
 
-| Target | Current status |
+| Target | Status |
 | --- | --- |
-| reForge | Implementation target; validation required |
-| Forge Classic / Forge | Implementation target; validation required |
-| Forge Neo | Implementation target; validation required |
+| reForge | Implementation target; real-machine validation required |
+| Forge Classic / Forge | Implementation target; real-machine validation required |
+| Forge Neo | Implementation target; real-machine validation required |
 | SDXL | Implementation target |
 | Anima / NextDiT | Architecture-compatible; validation pending |
-| Standard fixed-grid samplers | Intended |
-| Fixed-step multi-stage TDE / RK | Intended |
-| Adaptive ODE solvers | Unsupported / untested |
-| A1111 | Unsupported |
+| Fixed-grid single-stage samplers | Intended |
+| Fixed-step multi-stage TDE / RK samplers | Intended |
+| Adaptive ODE solvers | Not supported, untested |
+| A1111 | Not supported |
+
+ChebyCast is an early implementation. The status above will be updated as real-machine testing is completed.
 
 ---
 
@@ -286,32 +247,27 @@ ChebyCast is an approximation method, so pixel-identical output is not expected.
 
 **[English](#sd-webui-chebycast)** | 日本語
 
-Forge 派生 Stable Diffusion WebUI 向けの Chebyshev ベース feature forecasting 拡張機能です。solver-step-aware な実行方式と、固定ステップの multi-stage sampler を意識して設計しています。
+ChebyCast は、画像生成を高速化する拡張機能です。
 
-ChebyCast は **Spectrum** — *Adaptive Spectral Feature Forecasting for Diffusion Sampling Acceleration* (Han et al., CVPR 2026) — から着想を得ていますが、**faithful port ではありません**。
+生成中はノイズ除去モデル（UNet）が何度も呼び出されますが、その出力はステップごとに滑らかに変化していきます。ChebyCast はその変化を記録し、直近の出力から曲線をあてはめて「次に出てくるはずの値」を計算で予測します。予測したステップではモデルを実行しないため、その分だけ生成が速くなります。
 
-denoiser feature を Chebyshev basis と ridge regression で近似する中心的な考え方を引き継ぎつつ、Forge wrapper、solver-step grouping、非等間隔の中間 stage、rank に依存しない model output を扱うために実行方式を変更しています。
+他の同種の拡張機能との最大の違いは、**1 ステップの内部でモデルを複数回呼び出すサンプラー**（TDE Sampler や RK Sampler など）に正しく対応している点です。多くの実装は「モデル呼び出し 1 回 = サンプリング 1 ステップ」を前提としていますが、これらのサンプラーではその前提が成り立ちません。
+
+ChebyCast は **Spectrum**（*Adaptive Spectral Feature Forecasting for Diffusion Sampling Acceleration*、Han ほか、CVPR 2026）から着想を得ていますが、公式実装の移植ではありません。中心となる考え方を引き継いだうえで、Forge 上でどう動かすかを作り直しています。
 
 ---
 
-## 現在の状態
+## 動作条件
 
-ChebyCast は現時点では Forge 派生 WebUI 上での実機検証を前提とした初期実装です。
-
-設計上の対象:
+ChebyCast は Forge の `forge_objects` バックエンドを必要とします。対象は次のとおりです。
 
 - reForge
 - Stable Diffusion WebUI Forge / Forge Classic
 - Forge Neo
-- SDXL 系モデル
-- 固定 grid の single-stage sampler
-- 固定ステップの multi-stage TDE / RK sampler
 
-Anima / NextDiT および flow-matching モデルについては、forecast buffer 自体は rank-agnostic ですが、Forge / Forge Neo での実機検証が完了するまでは **validation pending** とします。
+A1111 は**非対応**です。
 
-Adaptive ODE method は現時点では **unsupported / untested** です。
-
-A1111 は Forge の `forge_objects` backend を必要とするため非対応です。
+対象モデルは SDXL 系、対象サンプラーはステップ幅が固定されたものです。ステップ幅を自動調整するサンプラー（adaptive ODE ソルバー）は**非対応・未検証**です。詳細は[対応状況](#対応状況)を参照してください。
 
 ---
 
@@ -323,15 +279,68 @@ A1111 は Forge の `forge_objects` backend を必要とするため非対応で
 https://github.com/seti9585/sd-webui-ChebyCast
 ```
 
-インストール後に WebUI を再起動してください。
+インストール後、WebUI を**再起動**してください。UI のリロードだけでは反映されません。
 
 ---
 
-## ChebyCast を作った理由
+## まず試す設定
 
-多くの diffusion acceleration wrapper は、denoiser の呼び出し 1 回を sampling step 1 回として扱うことがあります。
+最初は既定値のまま有効にして生成してみてください。既定値は安全側に寄せてあり、生成の最初の数ステップと最後の数ステップでは必ず実際のモデルを実行し、途中の区間だけ予測に置き換えるようになっています。
 
-しかし multi-stage solver では、1 solver step の内部で複数回 denoiser を評価します。
+TDE / RK Sampler で `kutta4` のような多段の解法を使っている場合も、最初は **Stage grouping** を `auto` のままにしてください。デバッグ出力を見てステップの区切りが正しく検出されていないと分かったときだけ、数値を指定します。
+
+比較の前に、次の 2 点を把握しておいてください。
+
+- **同じシードでも、ChebyCast を切ったときとまったく同じ画像にはなりません。** 予測したステップが生成の進み方をわずかにずらし、そのずれが最後まで残るためです。構図・配色・全体の造形は保たれますが、細部の描かれ方は変わります。これは不具合ではなく、この手法の性質です。
+- 絵が破綻する場合は、まず **Warmup steps** と **Stop forecasting offset** を増やし、**Window size** を下げてください。この 3 つが「生成のどれだけを予測に任せるか」を決めています。
+
+---
+
+## パラメータ
+
+UI 上の項目名は英語のままです。以下は各項目が何をするかの説明です。
+
+### よく調整するもの
+
+| 項目 | 内容 |
+| --- | --- |
+| **Window size** | 実際にモデルを実行する間隔です。大きくするほど省略が増えて速くなりますが、その分だけ遠い先を予測することになります。 |
+| **Warmup steps** | 冒頭で必ず実際のモデルを実行するステップ数です。予測の土台となる実測値が必要なため、ゼロにはできません。 |
+| **Stop forecasting offset** | 終盤で必ず実際のモデルを実行するステップ数です。細部は終盤のステップで決まるため、ここを実測のまま残すことが画質の保護になります。 |
+| **Blend weight (w)** | 予測値のうち、チェビシェフによるあてはめと、単純な近傍からの外挿を、どの比率で混ぜるかです。`0` で外挿のみ、`1` であてはめのみになります。 |
+| **Apply to hires pass** | hires 側にも ChebyCast を適用するかどうかです。適用する場合、hires 側は予測の状態をゼロから始めます。 |
+
+### 通常は触らないもの
+
+| 項目 | 内容 |
+| --- | --- |
+| **Chebyshev bases (m)** | あてはめに使う曲線の成分の数です。多いほど複雑な形に追従できますが、安定させるにはより多くの実測値が必要になります。 |
+| **Ridge regularization (lam)** | あてはめた曲線が大きく振れないように抑える強さです。大きいほど滑らかで保守的な曲線になります。 |
+| **Window growth (flex)** | 生成が進むにつれて、実際にモデルを実行する間隔を広げていきます。`0` なら間隔は一定のままです。 |
+| **History points (K)** | あてはめに使う過去の実測値を、何点まで保持するかです。 |
+| **Stage grouping** | `auto` は WebUI のステップカウンタからステップの区切りを判定します。数値を指定した場合は、その回数のモデル呼び出しを 1 ステップとしてまとめます。 |
+| **Fit points** | 実際に計算した中間段階をすべてあてはめに使うか、各ステップの最初の 1 点だけを使うかを選びます。 |
+| **Time coordinate** | あてはめの横軸に何を使うかです。`auto` は schedule、step、timestep、sigma の順に使えるものを探します。 |
+
+### `m` について
+
+公式 Spectrum の README では `algo.m` は**チェビシェフ基底の個数**と定義され、既定値は `4` です。ChebyCast も同じ意味で使っています。`m = 4` なら `T0`、`T1`、`T2`、`T3` の 4 成分を使います。内部では `m - 1` の形で保持していますが、UI の操作上それを意識する必要はありません。
+
+---
+
+## 仕組み
+
+### 基本的な考え方
+
+生成中のモデル出力は、全体として滑らかな曲線のようにふるまいます。曲線上の点がいくつか分かっていれば、そこに数式をあてはめて、まだ実際には計算していない位置の値を読み取ることができます。
+
+ChebyCast はこのあてはめに**チェビシェフ多項式**を使います。チェビシェフ多項式には、近似の誤差が区間の一方の端に集中せず全体に均等に散らばるという性質があります。1 ステップ先だけでなくある程度先まで予測したい場合に、この性質が効いてきます。
+
+あてはめの計算自体は、値が大きく振れないように抑える項を加えた最小二乗法（リッジ回帰）です。**Ridge regularization (lam)** はこの抑制項の強さにあたります。
+
+### 多段サンプラーへの対応 — この拡張機能を作った理由
+
+多くの高速化拡張機能は、モデルの呼び出し回数をそのまま数えて、1 回を 1 ステップとして扱います。しかし多段の解法では、1 ステップの内部でモデルを複数回評価します。
 
 ```text
 solver step N
@@ -341,218 +350,131 @@ solver step N
   k4
 ```
 
-raw model-call counter をそのまま forecasting state に使うと、sampler はまだ同じ solver step にいるのに forecasting 側だけ 4 step 進んだように扱う可能性があります。
+呼び出し回数をそのまま予測の時間軸に使うと、サンプラーはまだ N ステップ目の途中にいるのに、予測側は 4 ステップ進んだと認識してしまいます。結果として、まだ存在しない未来について予測を求めることになります。
 
-ChebyCast では、
+ChebyCast は、他の実装がひとまとめにしている次の 2 つを分離しています。
 
-```text
-solver-step 単位の forecast 判断
-```
+- **実測にするか予測にするかの判断** — ソルバーのステップごとに 1 回だけ行う
+- **時間軸上の位置** — 各段階がそれぞれ自分の位置を持つ
 
-と、
+これにより、同じステップに属する各段階は同一の判断を共有しつつ、あてはめには自分の正しい位置を使えます。
 
-```text
-stage ごとの time / sigma coordinate
-```
+### Time coordinate（横軸の選択）
 
-を分離します。
-
-これにより、同じ fixed-step RK / TDE solver step に属する stage は同じ actual / forecast 判断を共有しつつ、それぞれの stage 座標を forecasting に使用できます。
-
----
-
-## Spectrum との主な違い
-
-ChebyCast は Spectrum を主要な着想元としていますが、意図的な変更があります。
-
-### Solver-step-aware execution
-
-actual / forecast の判断を raw model call ごとではなく solver step ごとに保存します。
-
-1 sampling step の内部で複数回 denoiser を評価する fixed-step multi-stage method を想定した変更です。
-
-### Time coordinate
-
-`auto` では次の順番で coordinate を探します。
+`auto` は次の順で使える軸を探します。
 
 ```text
 schedule -> step -> timestep -> sigma
 ```
 
-raw model-call count を forecasting の時間軸として使わないことを重視しています。
+この順序の目的は、モデル呼び出し回数を軸として使う事態を避けることにあります。
 
-### Local extrapolation
+### Fit points（あてはめに使う点）
 
-非 spectral 側には **Newton divided differences** を使用します。
+**all stages** は、実際に計算した中間段階をすべてあてはめに使います。点数は増えますが、それらの点は軸の上に不均等に並びます。
 
-中間 stage の座標が非等間隔でも局所 extrapolation が意味を持つことを狙った変更です。
-
-### Rank-agnostic buffer
-
-wrapper output は float32 に flatten して forecasting buffer に保存し、prediction 後に元の shape へ戻します。
-
-SDXL 型の 4-D latent rank を固定前提にはしていません。
-
-### 独自 safety clamp
-
-forecast output には finite-value fallback と safety clamp を設けています。
-
-これは Spectrum 論文のパラメータではなく ChebyCast 独自の安全策です。
+**step head only** は、各ステップで最初に実測した 1 点だけを使います。点数は減りますが、より保守的です。
 
 ---
 
-## パラメータ
+## Spectrum との主な違い
 
-| パラメータ | 説明 |
+ChebyCast は Spectrum を出発点としつつ、いくつかの点を意図的に変更しています。
+
+| 箇所 | ChebyCast |
 | --- | --- |
-| **Blend weight (w)** | Newton local extrapolation と Chebyshev prediction の混合比。`0` = local のみ、`1` = Chebyshev のみ。 |
-| **Chebyshev bases (m)** | `T0 ... T(m-1)` の basis 数。既定値 `m=4` は degree 3。 |
-| **Ridge regularization (lam)** | Chebyshev coefficient fit の ridge 強度。 |
-| **Window size** | actual solver step と forecast step の初期間隔。 |
-| **Window growth (flex)** | actual step の後に effective window を増加させます。 |
-| **History points (K)** | fit に保持する最大 sample 数。 |
-| **Warmup steps** | 冒頭で必ず実 model を実行する solver step 数。 |
-| **Stop forecasting offset** | 終端側で必ず実 model を実行する solver step 数。 |
-| **Stage grouping** | `auto` は WebUI の sampling-step counter を使用。数値指定では N model call を 1 solver step にまとめます。 |
-| **Fit points** | actual な中間 stage を全て fit へ入れるか、solver step ごとの先頭のみ入れるかを選択。 |
-| **Apply to hires pass** | hires pass に新しい ChebyCast runtime を適用。 |
-| **Time coordinate** | fitting axis。`auto` は schedule、step、timestep、sigma の順に選択。 |
+| 判断の単位 | 実測か予測かの判断を、モデル呼び出しごとではなくソルバーのステップごとに保持 |
+| 時間軸 | モデル呼び出し回数は使わない。`auto` は schedule、step、timestep、sigma の順 |
+| 近傍からの外挿 | ニュートンの差分商を使用。点の間隔が不均等でも意味を保つ |
+| 出力の保持 | モデル出力を平坦化して保持し、予測後に元の形に戻す。特定の次元数を前提にしない |
+| 安全策 | 予測値に対する有限値チェックと上下限の制限 |
+
+安全策は ChebyCast 独自の実装であり、Spectrum 論文のパラメータではありません。
 
 ---
 
-## `m` の意味
+## 既定値
 
-公式 Spectrum README の `algo.m` は **Chebyshev basis の数**として定義され、既定値は `4` です。
+ChebyCast は Spectrum の既定値を再現することを目的としていません。
 
-ChebyCast も公開 UI では同じ意味に統一します。
-
-```text
-m = 4
-```
-
-なら、
-
-```text
-T0, T1, T2, T3
-```
-
-を使用し、polynomial degree は 3 です。
-
-内部では `degree = m - 1` として保持します。
-
----
-
-## 既定値と Spectrum の既定値
-
-ChebyCast は Spectrum の既定パラメータを再現することを目的としていません。
-
-現在の ChebyCast 既定値:
-
-| パラメータ | ChebyCast |
+| 項目 | ChebyCast の既定値 |
 | --- | ---: |
-| `w` | 0.40 |
-| `m` | 4 bases |
-| `lam` | 1.00 |
-| initial window | 2 |
-| flex | 0.00 |
-| history | 16 |
-| warmup | 4 |
-| stop offset | 3 |
+| Blend weight (w) | 0.40 |
+| Chebyshev bases (m) | 4 |
+| Ridge regularization (lam) | 1.00 |
+| Window size | 2 |
+| Window growth (flex) | 0.00 |
+| History points (K) | 16 |
+| Warmup steps | 4 |
+| Stop forecasting offset | 3 |
 
-現在の公式 Spectrum README では `w=1.0`、`lam=0.1`、`m=4` が既定値として記載され、公開後の補足として linear interpolation との convex mixture が説明されています。
+公式 Spectrum の README では、現在 `w = 1.0`、`lam = 0.1`、`m = 4` が既定値として記載されており、論文公開後の補足として線形補間との混合が説明されています。
 
-一方 ChebyCast の `w` は Chebyshev predictor と独自の Newton-divided-difference local extrapolator を混合します。そのため、両者の `w` を同じ意味の数値として扱わないでください。
+両者の `w` は**同じ意味の数値ではありません**。Spectrum の `w` はチェビシェフの予測と線形補間を混ぜますが、ChebyCast の `w` は前述のニュートン差分商による外挿と混ぜます。同じ数値を入れても同じ結果にはなりません。
 
 ---
 
-## Multi-stage sampler
+## Stage grouping を手動指定する場合
 
-WebUI の sampling-step counter だけでは solver-step boundary を適切に扱えない場合に備えて manual stage grouping を用意しています。
-
-たとえば固定 4-stage method を検証する場合:
+WebUI のステップカウンタからは望むステップ境界が取れない場合に備えて、境界を自分で指定できます。固定 4 段の解法であれば次のようになります。
 
 ```text
 Stage grouping = 4
 ```
 
-ただし Adaptive ODE method への一般的な解決策ではありません。
-
-adaptive method では stage 数が可変で、rejected step、embedded error evaluation、repeated call などが発生し得ます。固定の grouping 数では solver-step boundary を確実に再構成できません。
+これはステップ幅が固定された解法に対する回避策であり、**ステップ幅を自動調整する解法への対応策ではありません**。自動調整型の解法では段数が可変で、ステップの棄却と再試行、誤差評価のための追加評価などが発生します。固定の数値ではこれらの境界を再現できません。
 
 ---
 
-## Fit points
+## 他の拡張機能との併用
 
-### all stages
+ChebyCast は、既存の `model_function_wrapper` がある場合、**実際にモデルを実行するとき**にはそれを自分の内側で呼び出して維持できます。
 
-actual な intermediate stage を fit history に追加します。
+しかし**予測に置き換えたとき**はモデルの評価そのものを行わないため、内側の `model_function_wrapper` は実行されません。
 
-sample 数を増やせますが、中間 stage の座標は非等間隔になる場合があります。
-
-### step head only
-
-同じ forecasting key について solver step ごとの最初の actual update だけを history に追加します。
-
-より保守的な fit history です。
+したがって、すべてのモデル呼び出しで自身の処理が走ることを必要とする拡張機能については、併用可否を個別に確認する必要があります。
 
 ---
 
-## 他の wrapper との互換性
+## デバッグ出力
 
-ChebyCast は既存の `model_function_wrapper` がある場合、**actual model call** ではその wrapper を内側へ chain できます。
-
-一方 **forecast call** は model evaluation 自体を prediction で置き換えるため、内側の wrapper は実行されません。
-
-したがって、全 denoiser invocation で自身の wrapper 実行を必要とする拡張機能との互換性は個別に検証する必要があります。
-
----
-
-## Debug output
-
-WebUI 起動前に PowerShell で共有 debug flag を設定します。
+WebUI を起動する前に、PowerShell で共通のデバッグ変数を設定します。
 
 ```powershell
 $env:SD_WEBUI_SETI_DEBUG = "1"
 ```
 
-選択された time-coordinate source と run 終了時の summary が表示されます。
-
-step ごとの判断まで表示する場合:
+レベル 1 では、選択された横軸の種類と、生成終了時のまとめが出力されます。
 
 ```powershell
 $env:SD_WEBUI_SETI_DEBUG = "2"
 ```
 
+レベル 2 では、これに加えて各ステップを実測にしたか予測にしたかが出力されます。
+
+出力はモジュールロガーと stderr の両方に送られます。一部のバックエンドがモジュールレベルのロガー出力を抑制するためです。
+
 ---
 
 ## 検証方法
 
-ON / OFF 比較では以下を固定してください。
+有効・無効を比較するときは、モデル、プロンプトとネガティブプロンプト、シード、サンプラー、スケジューラ、ステップ数、CFG、解像度をすべて固定してください。
 
-- model
-- prompt / negative prompt
-- seed
-- sampler
-- scheduler
-- steps
-- CFG
-- resolution
+確認する項目は次のとおりです。
 
-確認項目:
+- エラーなく生成が完了すること
+- ログに NaN や Inf が出ないこと
+- 深刻な色崩れが起きていないこと
+- latent が発散していないこと
+- 構図が破綻していないこと
+- 実際のモデル呼び出し回数が減っていること
+- 生成時間が実際に短縮されていること
 
-- 正常に生成完了すること
-- NaN / Inf が発生しないこと
-- 深刻な色崩れがないこと
-- latent が発散しないこと
-- 構図が大きく破綻しないこと
-- denoiser call が実際に減ること
-- generation time が改善すること
-
-ChebyCast は近似法なので pixel-identical な出力は前提としません。
+[まず試す設定](#まず試す設定)に書いたとおり、ピクセル単位で一致することは目的ではなく、合否の基準にもなりません。
 
 ---
 
-## Compatibility status
+## 対応状況
 
 | 対象 | 現在の状態 |
 | --- | --- |
@@ -560,44 +482,56 @@ ChebyCast は近似法なので pixel-identical な出力は前提としませ�
 | Forge Classic / Forge | 実装対象・実機検証が必要 |
 | Forge Neo | 実装対象・実機検証が必要 |
 | SDXL | 実装対象 |
-| Anima / NextDiT | architecture 上は対応可能・実機検証待ち |
-| Standard fixed-grid sampler | Intended |
-| Fixed-step multi-stage TDE / RK | Intended |
-| Adaptive ODE solver | Unsupported / untested |
-| A1111 | Unsupported |
+| Anima / NextDiT | 構造上は対応可能・実機検証待ち |
+| ステップ幅固定の単段サンプラー | 対応予定 |
+| ステップ幅固定の多段 TDE / RK サンプラー | 対応予定 |
+| ステップ幅可変（adaptive ODE）ソルバー | 非対応・未検証 |
+| A1111 | 非対応 |
+
+ChebyCast は初期実装です。上記の状態は、実機での検証が完了しだい更新します。
 
 ---
 
 # License / Acknowledgements / References
 
-## License
+## License / ライセンス
 
-ChebyCast is released under the MIT License. See [`LICENSE`](LICENSE).
+ChebyCast is released under the MIT License. See [`LICENSE`](LICENSE). Third-party attribution is recorded in [`NOTICE`](NOTICE).
 
-Third-party attribution is recorded in [`NOTICE`](NOTICE).
+本拡張機能は MIT License で公開しています。全文は [`LICENSE`](LICENSE) を参照してください。第三者の著作物に関する表示は [`NOTICE`](NOTICE) に記載しています。
 
-## Acknowledgements
+## Acknowledgements / 謝辞
 
-ChebyCast is primarily inspired by the Spectrum paper and official implementation:
+**Paper and official implementation / 論文および公式実装**
 
-- Jiaqi Han, Juntong Shi, Puheng Li, Haotian Ye, Qiushan Guo, Stefano Ermon
-- *Adaptive Spectral Feature Forecasting for Diffusion Sampling Acceleration*
-- CVPR 2026 / arXiv:2603.01623
-- Official implementation: https://github.com/hanjq17/Spectrum
+Jiaqi Han, Juntong Shi, Puheng Li, Haotian Ye, Qiushan Guo, Stefano Ermon
+*Adaptive Spectral Feature Forecasting for Diffusion Sampling Acceleration*
+CVPR 2026 / [arXiv:2603.01623](https://arxiv.org/abs/2603.01623)
+Official implementation: [hanjq17/Spectrum](https://github.com/hanjq17/Spectrum)
 
-The official Spectrum repository is MIT licensed and credits TaylorSeer as an inspiration for part of its codebase.
+ChebyCast is built on the idea presented in this paper. The official Spectrum repository is MIT licensed and credits TaylorSeer as an inspiration for part of its codebase.
 
-ChebyCast was developed as a separate Forge-oriented implementation. It should not be described as an official Spectrum port or a faithful reproduction of the official execution behavior.
+ChebyCast は上記論文で示された考え方をもとにしています。公式リポジトリは MIT License で公開されており、コードの一部について TaylorSeer を着想元として挙げています。
 
-Existing community implementations were useful references for understanding practical WebUI integration, including:
+**Scope of this implementation / 本実装の位置づけ**
 
-- https://github.com/hirorohi03/sd-webui-forge-spectrum
-- https://github.com/hirorohi03/sd-forge-spectrum-faithful
-- https://github.com/ruwwww/comfyui-spectrum-sdxl
-- https://github.com/judian17/ComfyUI-Spectrum
+ChebyCast was written as a separate, Forge-oriented implementation. It should not be described as an official Spectrum port, nor as a faithful reproduction of the official execution behaviour.
 
-## References
+ChebyCast は Forge 向けに独自に書き起こした実装です。Spectrum の公式移植ではなく、公式実装の挙動を忠実に再現したものでもありません。
 
-- Spectrum paper: https://arxiv.org/abs/2603.01623
-- Spectrum official repository: https://github.com/hanjq17/Spectrum
-- TaylorSeer: https://github.com/Shenyi-Z/TaylorSeer
+**Reference implementations / 参考実装**
+
+The following community implementations were consulted for practical WebUI integration. ChebyCast does not derive its code from them.
+
+WebUI への組み込み方を理解するにあたり、以下のコミュニティ実装を参考にさせていただきました。コードを流用したものではありません。
+
+- [hirorohi03/sd-webui-forge-spectrum](https://github.com/hirorohi03/sd-webui-forge-spectrum)
+- [hirorohi03/sd-forge-spectrum-faithful](https://github.com/hirorohi03/sd-forge-spectrum-faithful)
+- [ruwwww/comfyui-spectrum-sdxl](https://github.com/ruwwww/comfyui-spectrum-sdxl)
+- [judian17/ComfyUI-Spectrum](https://github.com/judian17/ComfyUI-Spectrum)
+
+## References / 典拠
+
+- Spectrum paper / 論文: [arXiv:2603.01623](https://arxiv.org/abs/2603.01623)
+- Spectrum official repository / 公式リポジトリ: [hanjq17/Spectrum](https://github.com/hanjq17/Spectrum)
+- TaylorSeer: [Shenyi-Z/TaylorSeer](https://github.com/Shenyi-Z/TaylorSeer)
