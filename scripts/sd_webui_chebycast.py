@@ -60,8 +60,35 @@ STAGE_GROUPING_CHOICES = ["auto", "1", "2", "3", "4", "6"]
 FIT_POINTS_CHOICES = ["all stages", "step head only"]
 TIME_COORD_CHOICES = ["auto", "schedule", "step", "timestep", "sigma"]
 
-# enable, w, m, lam, window, flex, warmup, stop, group, fit, history, hires, coord
-N_COMPONENTS = 13
+# enable, w, m, lam, window, flex, warmup, stop, group, fit, history, hires,
+# coord, neg_skip
+N_COMPONENTS = 14
+
+
+def _webui_negative_skip_active(p) -> bool:
+    """Return True when the WebUI's own negative-skip options are on."""
+    try:
+        s_min_uncond = getattr(p, "s_min_uncond", None)
+        if s_min_uncond is None:
+            s_min_uncond = getattr(shared.opts, "s_min_uncond", 0.0)
+        if float(s_min_uncond or 0.0) > 0.0:
+            return True
+    except Exception:
+        pass
+
+    try:
+        if float(getattr(shared.opts, "s_min_uncond", 0.0) or 0.0) > 0.0:
+            return True
+    except Exception:
+        pass
+
+    try:
+        if float(getattr(shared.opts, "skip_early_cond", 0.0) or 0.0) > 0.0:
+            return True
+    except Exception:
+        pass
+
+    return False
 
 
 def _has_forge_backend(p) -> bool:
@@ -213,15 +240,27 @@ class ChebyCastScript(scripts.Script):
                     value=False,
                 )
 
-            time_coord = gr.Dropdown(
-                label="Time coordinate",
-                choices=TIME_COORD_CHOICES,
-                value="auto",
-                info=(
-                    "auto prefers schedule, then solver-step coordinate, "
-                    "then model timestep, then raw sigma"
-                ),
-            )
+            with gr.Row():
+                time_coord = gr.Dropdown(
+                    label="Time coordinate",
+                    choices=TIME_COORD_CHOICES,
+                    value="auto",
+                    info=(
+                        "auto prefers schedule, then solver-step coordinate, "
+                        "then model timestep, then raw sigma"
+                    ),
+                )
+                neg_skip = gr.Slider(
+                    label="Skip negative in last N steps",
+                    minimum=0,
+                    maximum=20,
+                    step=1,
+                    value=0,
+                    info=(
+                        "0 = off. Runs only the positive prompt in the last "
+                        "N solver steps (CFG 1). Limited to the stop offset."
+                    ),
+                )
 
         components = [
             enabled,
@@ -237,6 +276,7 @@ class ChebyCastScript(scripts.Script):
             history,
             apply_hires,
             time_coord,
+            neg_skip,
         ]
 
         # ui-config.json can silently override component bounds by label.
@@ -258,6 +298,7 @@ class ChebyCastScript(scripts.Script):
                 PasteField(history, "ChebyCast history"),
                 PasteField(apply_hires, "ChebyCast hires"),
                 PasteField(time_coord, "ChebyCast coord"),
+                PasteField(neg_skip, "ChebyCast neg skip"),
             ]
 
         return components
@@ -290,6 +331,7 @@ class ChebyCastScript(scripts.Script):
             history,
             apply_hires,
             time_coord,
+            neg_skip,
         ) = resolved
 
         if not enabled:
@@ -318,6 +360,27 @@ class ChebyCastScript(scripts.Script):
         # Public m is the number of bases. Internal degree is m - 1.
         degree = max(1, int(basis_count) - 1)
 
+        try:
+            neg_skip_requested = max(0, int(neg_skip))
+        except Exception:
+            neg_skip_requested = 0
+
+        neg_skip_steps = min(neg_skip_requested, max(0, int(stop_offset)))
+        if neg_skip_requested > neg_skip_steps:
+            _warn(
+                "Skip negative in last N steps (%d) is larger than the stop "
+                "offset (%d); using %d."
+                % (neg_skip_requested, int(stop_offset), neg_skip_steps)
+            )
+
+        if neg_skip_steps > 0 and _webui_negative_skip_active(p):
+            _warn(
+                "The WebUI negative-prompt skip settings (Negative Guidance "
+                "minimum sigma / Ignore negative prompt during early steps) "
+                "are also active. Both will apply; consider turning the "
+                "WebUI settings off."
+            )
+
         unet = p.sd_model.forge_objects.unet.clone()
         remove_chebycast_patches(unet)
 
@@ -336,6 +399,7 @@ class ChebyCastScript(scripts.Script):
             step_provider=lambda: shared.state.sampling_step,
             model_sampling=get_model_sampling(unet),
             coord_mode=str(time_coord),
+            neg_skip_steps=neg_skip_steps,
         )
 
         apply_chebycast(unet, runtime)
@@ -362,6 +426,8 @@ class ChebyCastScript(scripts.Script):
             gp["ChebyCast history"] = int(history)
             gp["ChebyCast hires"] = bool(apply_hires)
             gp["ChebyCast coord"] = str(time_coord)
+            if neg_skip_steps > 0:
+                gp["ChebyCast neg skip"] = int(neg_skip_steps)
 
         window_int = max(1, int(math.floor(float(window_size))))
         _log(
@@ -370,7 +436,7 @@ class ChebyCastScript(scripts.Script):
                 "applied: pass=%s total_steps=%d w=%.2f m=%d degree=%d "
                 "lam=%.2f window=%d flex=%.2f warmup=%d "
                 "stop_offset=%d grouping=%s fit_points=%s "
-                "history=%d coord=%s"
+                "history=%d coord=%s neg_skip=%d"
             )
             % (
                 "hires" if _is_hires_pass(p) else "main",
@@ -387,6 +453,7 @@ class ChebyCastScript(scripts.Script):
                 str(fit_points),
                 int(history),
                 str(time_coord),
+                int(neg_skip_steps),
             ),
         )
 
