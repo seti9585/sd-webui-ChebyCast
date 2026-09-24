@@ -24,12 +24,19 @@ ChebyCast separates solver steps from individual U-Net calls, allowing fixed-ste
 
 ## Measured result
 
-Measured (TDE Sampler / kutta4 / Align Your Steps / 35 steps / 896x1152 / RTX 4080 SUPER / no launch arguments):
+Common conditions: reForge / SDXL (Illustrious-based checkpoint) / Align Your Steps / 35 steps / CFG 7 / 896x1152 / RTX 4080 SUPER / no launch arguments / ChebyCast default settings. Sampling time from the WebUI progress bar, median of 5 runs after one warm-up run.
 
 ```text
-U-Net calls  139 -> 83       (-40%)
-Time         26.1s -> 15.75s (-40%)
+DPM++ 2M SDE (Stage grouping 1)
+U-Net calls  35 -> 22          (-37%)
+Sampling     7.07s -> 4.82s    (-32%)
+
+TDE Sampler / kutta4 (Stage grouping auto)
+U-Net calls  139 -> 83         (-40%)
+Sampling     26.1s -> 16.1s    (-38%)
 ```
+
+The time saved grows with the time spent per step, so slower samplers and heavier settings benefit more in absolute seconds.
 
 ---
 
@@ -43,6 +50,8 @@ https://github.com/seti9585/sd-webui-ChebyCast
 
 Restart the WebUI after installation.
 
+When updating from an older version, **restart the WebUI** instead of using Reload UI. A new control was added, and Reload UI does not rebuild the panel.
+
 ---
 
 ## Quick start
@@ -52,7 +61,16 @@ Restart the WebUI after installation.
 3. Leave the other settings at their defaults.
 4. Generate normally.
 
-For normal use, keep **Stage grouping** and **Time coordinate** on `auto`.
+Keep **Time coordinate** on `auto`.
+
+Set **Stage grouping** according to the sampler:
+
+| Sampler type | Examples | Stage grouping |
+| --- | --- | --- |
+| One U-Net call per step | Euler, Euler a, DPM++ 2M, DPM++ 2M SDE | `1` |
+| TDE Sampler / RK Sampler fixed-step methods | kutta4 | `auto` |
+
+With `auto`, standard WebUI samplers report the step number one call late, so every step boundary (Warmup, Stop offset, Skip negative) shifts by one. Setting `1` counts steps from the calls themselves and avoids this. It assumes positive and negative are evaluated together in one call (the normal case).
 
 ---
 
@@ -60,6 +78,7 @@ For normal use, keep **Stage grouping** and **Time coordinate** on `auto`.
 
 **Want more speed -> increase Window size (faster / larger difference from OFF)**  
 **Want to protect image quality -> increase Warmup / Stop offset (more conservative / less speedup)**  
+**Want a little more speed in the final steps -> Skip negative in last N steps (see below)**  
 **Want to experiment with the prediction method -> w / m / lam**
 
 With very low step counts, the forecastable middle section becomes small, so the speedup may be limited.
@@ -78,10 +97,100 @@ With very low step counts, the forecastable middle section becomes small, so the
 | **Ridge regularization (lam)** | 1.00 | Larger = stronger regularization. |
 | **Window growth (flex)** | 0.00 | Larger values make forecasting more aggressive as sampling progresses. |
 | **History points (K)** | 16 | Larger values keep more real samples available for fitting. |
-| **Stage grouping** | `auto` | Groups model calls into solver steps. Usually leave on `auto`. |
+| **Stage grouping** | `auto` | Groups model calls into solver steps. `1` for one-call-per-step samplers, `auto` for TDE / RK Sampler (see Quick start). |
 | **Fit points** | `all stages` | Chooses which real stage outputs update the fit. |
-| **Time coordinate** | `auto` | Chooses the sampling-progress axis used by the predictor. |
 | **Apply to hires pass** | Off | Applies ChebyCast to the Hires.fix pass as well. |
+| **Time coordinate** | `auto` | Chooses the sampling-progress axis used by the predictor. |
+| **Skip negative in last N steps** | 0 | `0` = off. In the last N solver steps, only the positive prompt is evaluated. Limited to the Stop forecasting offset. |
+
+---
+
+## Skip negative in last N steps
+
+An optional setting that is **off by default** (`0`). With `0`, ChebyCast behaves exactly as before.
+
+### What it does
+
+With normal CFG, each U-Net call evaluates the positive prompt and the negative prompt together.
+
+When this setting is `1` or more, ChebyCast evaluates **only the positive prompt** in the last N solver steps and uses that result in place of the negative result as well.
+
+```text
+Normal final steps:       positive + negative -> CFG
+With this setting:        positive only       -> same as CFG 1
+```
+
+Those final steps therefore run as if CFG were 1. Details are mostly settled by then, but the image is **not identical** to the result with `0`.
+
+The speed gain is expected to be modest, because it applies only to the last few steps.
+
+### How to use it
+
+Set it to the same value as **Stop forecasting offset**. Those steps are always real U-Net calls, so this setting does not interfere with forecasting.
+
+```text
+Stop forecasting offset = 4
+Skip negative in last N steps = 4
+```
+
+A value larger than the Stop forecasting offset is reduced to the Stop forecasting offset, and a warning is printed to the console.
+
+For multi-stage samplers, the decision is shared by all stages of the same solver step, so one step never mixes stages with and without the negative prompt.
+
+### Do not enable the WebUI's own setting at the same time
+
+reForge and Forge Neo have a similar built-in option in **Settings**. When you use this ChebyCast setting, **keep the WebUI option off.**
+
+| WebUI | Setting | Value to use |
+| --- | --- | --- |
+| reForge / Forge | Negative Guidance minimum sigma | `0` |
+| reForge / Forge | Ignore negative prompt during early sampling | `0` |
+| Forge Neo | Skip Negative Prompt during Later Steps | `0` |
+| Forge Neo | Ignore Negative Prompt during Early Steps | `0` |
+
+With the sigma value at `0`, the "all steps" checkbox has no effect, so it can be left as it is.
+
+Reasons:
+
+- **The two overlap.** Calls that the WebUI has already reduced to positive-only are passed through unchanged by ChebyCast, so there is no extra speedup.
+- **The WebUI option decides by sigma, not by step.** In multi-stage samplers, the last stage of one step and the first stage of the next step have the same sigma. Whatever threshold you choose, one boundary step ends up with some stages with the negative prompt and some without.
+- **The WebUI option applies to every generation**, including generations without ChebyCast and the Hires.fix pass. The ChebyCast setting applies only when ChebyCast is enabled, and it is saved in the PNG infotext.
+
+ChebyCast prints a console warning when both are active.
+
+### Reference: WebUI sigma values that roughly match N
+
+If you previously used **Negative Guidance minimum sigma**, the table below shows the approximate value that covered the same final steps. **For comparison only.** With ChebyCast, set the WebUI option to `0` and use N instead.
+
+Conditions: SDXL, 35 steps, reForge scheduler code with default settings (Karras rho 7.0, Beta alpha 0.6 / beta 0.6). The values are calculated from the scheduler code and were not checked against console output. Different step counts or scheduler settings give different values. These values do not apply to Anima (its sigma range is different).
+
+| N | Align Your Steps | Karras | Beta | SGM Uniform |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 0.03 | 0.03 | 0.08 | 0.17 |
+| 2 | 0.05 | 0.04 | 0.13 | 0.25 |
+| 3 | 0.07 | 0.06 | 0.18 | 0.32 |
+| 4 | 0.10 | 0.07 | 0.23 | 0.38 |
+| 5 | 0.13 | 0.09 | 0.28 | 0.45 |
+| 6 | 0.16 | 0.12 | 0.34 | 0.51 |
+
+Karras and Align Your Steps pack many steps into very small sigma values near the end, so the numbers are small. Beta and SGM Uniform keep larger sigma values near the end, so the same N needs a larger number.
+
+### When it is not applied
+
+The step is run normally (positive and negative) when:
+
+- positive and negative are sent to the U-Net as separate calls (for example, split because of low VRAM),
+- ControlNet is active,
+- the prompt layout is not one positive + one negative (for example, `AND` prompts),
+- the positive-only call fails.
+
+### Guidance extensions
+
+In the skipped steps, guidance extensions receive a negative result that is equal to the positive result. The guidance difference becomes zero, so most extensions simply have nothing to add.
+
+With [sd-webui-TCFG](https://github.com/seti9585/sd-webui-TCFG), [sd-webui-SkimmedCFG](https://github.com/seti9585/sd-webui-SkimmedCFG), and [sd-webui-DifferenceCFG](https://github.com/seti9585/sd-webui-DifferenceCFG), the result is the positive prediction unchanged. With [sd-webui-APG](https://github.com/seti9585/sd-webui-APG), the same is true when Momentum is `0`. When Momentum is not `0`, a small amount of guidance from earlier steps remains for the first few skipped calls and fades out.
+
+Other guidance extensions should be tested individually.
 
 ---
 
@@ -89,7 +198,7 @@ With very low step counts, the forecastable middle section becomes small, so the
 
 ChebyCast is disabled for the Hires.fix pass by default.
 
-Enable **Apply to hires pass** if you want to use it there. The Hires.fix pass starts with its own prediction state.
+Enable **Apply to hires pass** if you want to use it there. The Hires.fix pass starts with its own prediction state. **Skip negative in last N steps** also applies to the Hires.fix pass when this option is on.
 
 ---
 
@@ -169,6 +278,8 @@ Existing wrappers are preserved on **real U-Net calls**.
 
 On a **forecasted call**, the U-Net itself is not executed, so an inner wrapper does not run either.
 
+In steps where **Skip negative in last N steps** is active, an inner wrapper runs with the positive part only.
+
 Extensions that require their wrapper to execute on every denoiser call should therefore be tested individually.
 
 ---
@@ -181,7 +292,13 @@ Set the environment variable before launching the WebUI.
 $env:SD_WEBUI_SETI_DEBUG = "1"
 ```
 
-Level 1 reports the selected time coordinate and a run summary.
+Level 1 reports the selected time coordinate and a run summary. When **Skip negative in last N steps** is `1` or more, the summary also shows how many calls were evaluated with the positive prompt only.
+
+```text
+neg-skip last=4 calls=15 fallbacks=0
+```
+
+`fallbacks` counts calls that were run normally for one of the reasons listed in "When it is not applied".
 
 ```powershell
 $env:SD_WEBUI_SETI_DEBUG = "2"
@@ -208,6 +325,8 @@ Main differences include:
 - the local prediction branch uses Newton divided differences,
 - model outputs are stored as flattened float32 history and restored to their original shape,
 - ChebyCast includes its own non-finite fallback and prediction clamp.
+
+**Skip negative in last N steps** is not part of Spectrum. It is an optional ChebyCast feature.
 
 ---
 
@@ -237,12 +356,19 @@ ChebyCast は solver step と個々の U-Net 呼び出しを分けて扱うた�
 
 ## 実測結果
 
-実測条件: TDE Sampler / kutta4 / Align Your Steps / 35 steps / 896x1152 / RTX 4080 SUPER / 起動引数なし
+共通条件: reForge / SDXL（Illustrious 系モデル）/ Align Your Steps / 35 steps / CFG 7 / 896x1152 / RTX 4080 SUPER / 起動引数なし / ChebyCast 既定値。時間は WebUI のプログレスバーのサンプリング時間で、慣らしの 1 回を除いた 5 回の中央値です。
 
 ```text
-U-Net calls  139 -> 83       (-40%)
-Time         26.1s -> 15.75s (-40%)
+DPM++ 2M SDE（Stage grouping 1）
+U-Net calls  35 -> 22          (-37%)
+Sampling     7.07s -> 4.82s    (-32%)
+
+TDE Sampler / kutta4（Stage grouping auto）
+U-Net calls  139 -> 83         (-40%)
+Sampling     26.1s -> 16.1s    (-38%)
 ```
+
+1 ステップにかかる時間が長いほど、短縮できる秒数も大きくなります。
 
 ---
 
@@ -256,6 +382,8 @@ https://github.com/seti9585/sd-webui-ChebyCast
 
 インストール後、WebUI を再起動してください。
 
+旧版から更新した場合も、Reload UI ではなく **WebUI を再起動**してください。設定項目が増えているため、Reload UI ではパネルが作り直されません。
+
 ---
 
 ## まず使う
@@ -265,7 +393,16 @@ https://github.com/seti9585/sd-webui-ChebyCast
 3. 他は既定値のまま
 4. そのまま生成
 
-通常は **Stage grouping** と **Time coordinate** を `auto` のまま使ってください。
+**Time coordinate** は `auto` のまま使ってください。
+
+**Stage grouping** はサンプラーに合わせて設定します。
+
+| サンプラーの種類 | 例 | Stage grouping |
+| --- | --- | --- |
+| 1 ステップで U-Net を 1 回呼ぶもの | Euler、Euler a、DPM++ 2M、DPM++ 2M SDE | `1` |
+| TDE Sampler / RK Sampler の固定ステップ法 | kutta4 | `auto` |
+
+`auto` のままだと、WebUI 標準のサンプラーではステップ番号が 1 呼び出し遅れて伝わるため、Warmup・Stop offset・Skip negative の境目がすべて 1 つずれます。`1` にすると、呼び出し回数からステップを数えるので、このずれが起きません。ポジティブとネガティブを 1 回の呼び出しでまとめて計算していること（通常の状態）が前提です。
 
 ---
 
@@ -273,6 +410,7 @@ https://github.com/seti9585/sd-webui-ChebyCast
 
 **速度を上げたい -> Window size を大きくする（高速化↑ / OFFとの差も増えやすい）**  
 **画質を守りたい -> Warmup / Stop offset を大きくする（保守的 / 高速化↓）**  
+**最後の数ステップをもう少し速くしたい -> Skip negative in last N steps（後述）**  
 **予測方式そのものを実験したい -> w / m / lam**
 
 step 数が少ない設定では forecast できる中間区間が短くなるため、高速化の効果が出にくくなります。
@@ -291,10 +429,100 @@ step 数が少ない設定では forecast できる中間区間が短くなる�
 | **Ridge regularization (lam)** | 1.00 | 大きいほど正則化を強くします。 |
 | **Window growth (flex)** | 0.00 | 大きいほど、生成が進むにつれて forecast を積極的にします。 |
 | **History points (K)** | 16 | 大きいほど、fit に保持する実測点を増やします。 |
-| **Stage grouping** | `auto` | モデル呼び出しを solver step にまとめます。通常は `auto` のままです。 |
+| **Stage grouping** | `auto` | モデル呼び出しを solver step にまとめます。1 ステップ 1 回のサンプラーは `1`、TDE / RK Sampler は `auto`（「まず使う」参照）。 |
 | **Fit points** | `all stages` | どの実測 stage を fit に使うかを選びます。 |
-| **Time coordinate** | `auto` | 予測に使う sampling progress の軸を選びます。 |
 | **Apply to hires pass** | OFF | Hires.fix 側にも ChebyCast を適用します。 |
+| **Time coordinate** | `auto` | 予測に使う sampling progress の軸を選びます。 |
+| **Skip negative in last N steps** | 0 | `0` = OFF。最後の N solver step でポジティブプロンプトだけを計算します。上限は Stop forecasting offset です。 |
+
+---
+
+## Skip negative in last N steps
+
+**既定では OFF**（`0`）の追加機能です。`0` のときの動作は従来とまったく同じです。
+
+### 何をするか
+
+通常の CFG では、U-Net を呼ぶたびにポジティブプロンプトとネガティブプロンプトの両方を計算します。
+
+この項目を `1` 以上にすると、最後の N solver step では**ポジティブプロンプトだけ**を計算し、その結果をネガティブ側の結果としても使います。
+
+```text
+通常の終盤:       ポジティブ + ネガティブ -> CFG
+この項目を使う:   ポジティブのみ         -> CFG 1 と同じ
+```
+
+そのため、その区間は CFG 1 相当で生成されます。終盤は細部がほぼ決まった段階ですが、`0` のときと**同じ画像にはなりません**。
+
+最後の数ステップだけに効く機能なので、速度の向上は控えめです。
+
+### 使い方
+
+**Stop forecasting offset と同じ値**にしてください。この区間は常に実際の U-Net 呼び出しなので、予測の邪魔をしません。
+
+```text
+Stop forecasting offset = 4
+Skip negative in last N steps = 4
+```
+
+Stop forecasting offset より大きい値を入れた場合は、Stop forecasting offset の値に切り詰め、コンソールに注意を表示します。
+
+多段サンプラーでは、同じ solver step の全 stage に同じ判断を使います。1 つのステップの中で、ネガティブありの stage となしの stage が混ざることはありません。
+
+### WebUI 側の設定は同時に有効にしない
+
+reForge と Forge Neo には、**Settings** 側に似た機能があります。ChebyCast のこの項目を使うときは、**WebUI 側の設定は無効のまま**にしてください。
+
+| WebUI | 設定 | 使う値 |
+| --- | --- | --- |
+| reForge / Forge | Negative Guidance minimum sigma | `0` |
+| reForge / Forge | Ignore negative prompt during early sampling | `0` |
+| Forge Neo | Skip Negative Prompt during Later Steps | `0` |
+| Forge Neo | Ignore Negative Prompt during Early Steps | `0` |
+
+sigma の値が `0` なら、「all steps」のチェックボックスは効かないので、そのままで構いません。
+
+理由:
+
+- **同じ処理が重なります。** WebUI 側がすでにポジティブだけにした呼び出しは、ChebyCast がそのまま通すので、それ以上速くなりません。
+- **WebUI 側はステップではなく sigma で判定します。** 多段サンプラーでは、あるステップの最後の stage と次のステップの最初の stage が同じ sigma になります。どのしきい値を選んでも、境目のステップでネガティブありの stage となしの stage が混ざります。
+- **WebUI 側はすべての生成にかかります。** ChebyCast を使わない生成や Hires.fix 側にも効きます。ChebyCast の項目は ChebyCast が有効なときだけ効き、PNG の infotext にも記録されます。
+
+両方が有効になっていると、ChebyCast がコンソールに注意を表示します。
+
+### 参考: N に相当する WebUI 側の sigma 値
+
+以前 **Negative Guidance minimum sigma** を使っていた場合、同じ終盤のステップを対象にしていた値の目安は次のとおりです。**比較用の参考値です。** ChebyCast を使うときは WebUI 側を `0` にして、N で指定してください。
+
+条件: SDXL、35 steps、reForge のスケジューラ実装と既定設定（Karras rho 7.0、Beta alpha 0.6 / beta 0.6）。値はスケジューラのコードから計算したもので、実機のコンソール表示とは照合していません。ステップ数やスケジューラの設定が変わると値も変わります。Anima には当てはまりません（sigma の範囲が異なるため）。
+
+| N | Align Your Steps | Karras | Beta | SGM Uniform |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 0.03 | 0.03 | 0.08 | 0.17 |
+| 2 | 0.05 | 0.04 | 0.13 | 0.25 |
+| 3 | 0.07 | 0.06 | 0.18 | 0.32 |
+| 4 | 0.10 | 0.07 | 0.23 | 0.38 |
+| 5 | 0.13 | 0.09 | 0.28 | 0.45 |
+| 6 | 0.16 | 0.12 | 0.34 | 0.51 |
+
+Karras と Align Your Steps は終盤のステップがとても小さな sigma に詰まっているため、値が小さくなります。Beta と SGM Uniform は終盤でも sigma が比較的大きく残るため、同じ N でも値が大きくなります。
+
+### 適用されない場合
+
+次の場合、そのステップは通常どおり（ポジティブとネガティブの両方）計算します。
+
+- VRAM 不足などで、ポジティブとネガティブが別々の U-Net 呼び出しに分かれている
+- ControlNet が有効
+- ポジティブ 1 つ + ネガティブ 1 つの形になっていない（`AND` 構文など）
+- ポジティブだけの呼び出しが失敗した
+
+### ガイダンス系拡張機能との併用
+
+省略したステップでは、ガイダンス系拡張機能にはポジティブと同じ値がネガティブの結果として渡ります。ガイダンスの差が 0 になるので、多くの拡張機能は何もしないのと同じになります。
+
+[sd-webui-TCFG](https://github.com/seti9585/sd-webui-TCFG)、[sd-webui-SkimmedCFG](https://github.com/seti9585/sd-webui-SkimmedCFG)、[sd-webui-DifferenceCFG](https://github.com/seti9585/sd-webui-DifferenceCFG) では、ポジティブの予測がそのまま結果になります。[sd-webui-APG](https://github.com/seti9585/sd-webui-APG) も Momentum が `0` なら同じです。Momentum が `0` 以外の場合は、それまでのステップのガイダンスが、省略区間の最初の数回だけ少し残り、すぐに弱まります。
+
+その他のガイダンス系拡張機能は、個別に併用確認をしてください。
 
 ---
 
@@ -302,7 +530,7 @@ step 数が少ない設定では forecast できる中間区間が短くなる�
 
 Hires.fix 側では ChebyCast は既定で無効です。
 
-使用する場合は **Apply to hires pass** を ON にしてください。Hires.fix 側では独立した予測状態を新しく開始します。
+使用する場合は **Apply to hires pass** を ON にしてください。Hires.fix 側では独立した予測状態を新しく開始します。この項目が ON のときは、**Skip negative in last N steps** も Hires.fix 側に適用されます。
 
 ---
 
@@ -386,6 +614,8 @@ ChebyCast は Forge の `model_function_wrapper` を使います。
 
 一方、**予測へ置き換えた場合**は U-Net 自体を呼ばないため、内側の wrapper も実行されません。
 
+**Skip negative in last N steps** が働いているステップでは、内側の wrapper はポジティブ側だけで実行されます。
+
 すべての denoiser call で wrapper が実行されることを必要とする拡張機能は、個別に併用確認が必要です。
 
 ---
@@ -398,7 +628,13 @@ WebUI 起動前に環境変数を設定します。
 $env:SD_WEBUI_SETI_DEBUG = "1"
 ```
 
-Level 1 では、選択された time coordinate と run summary を表示します。
+Level 1 では、選択された time coordinate と run summary を表示します。**Skip negative in last N steps** が `1` 以上のときは、ポジティブだけで計算した呼び出し回数も表示します。
+
+```text
+neg-skip last=4 calls=15 fallbacks=0
+```
+
+`fallbacks` は、「適用されない場合」の理由で通常どおり計算した回数です。
 
 ```powershell
 $env:SD_WEBUI_SETI_DEBUG = "2"
@@ -425,6 +661,8 @@ ChebyCast は Forge 系 WebUI 向けに独自に書き起こした実装です�
 - 局所予測に Newton divided differences を使用
 - model output を float32 に平坦化して履歴保持し、元の shape に戻す
 - non-finite fallback と独立した prediction clamp を実装
+
+**Skip negative in last N steps** は Spectrum の一部ではなく、ChebyCast 独自の追加機能です。
 
 ---
 
@@ -469,3 +707,4 @@ These implementations were consulted only for practical WebUI integration. No so
 
 - Spectrum paper / 論文: [arXiv:2603.01623](https://arxiv.org/abs/2603.01623)
 - Spectrum official repository / 公式リポジトリ: [hanjq17/Spectrum](https://github.com/hanjq17/Spectrum)
+- Negative Guidance minimum sigma (original A1111 option) / WebUI 側の同種設定の元: [AUTOMATIC1111/stable-diffusion-webui PR #9177](https://github.com/AUTOMATIC1111/stable-diffusion-webui/pull/9177)
