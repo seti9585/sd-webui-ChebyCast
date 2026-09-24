@@ -23,6 +23,13 @@ Key differences:
        extrapolate across non-uniform stage spacing.
     4. Forecast buffers are flattened float32 tensors and restored to the
        original output shape, avoiding a fixed latent-rank assumption.
+
+Optional extension (off by default):
+    Negative skip in the last N solver steps. Inside the stop-forecasting
+    tail, the model is called for the cond chunk only and the result is
+    returned for both the cond and uncond slots, so the CFG result equals
+    the cond prediction. The decision is made per solver step, so all
+    stages of one multi-stage step are treated the same way.
 """
 
 from __future__ import annotations
@@ -464,6 +471,7 @@ class ChebyCastRuntime:
         step_provider,
         model_sampling,
         coord_mode: str = "auto",
+        neg_skip_steps: int = 0,
     ):
         self.w = float(w)
         self.degree = int(degree)
@@ -485,6 +493,17 @@ class ChebyCastRuntime:
 
         if self.manual_group <= 0:
             self.warmup_steps = max(2, self.warmup_steps)
+
+        # Negative-prompt skip in the trailing solver steps.
+        # It is limited to the stop-forecasting tail so that forecast
+        # buffers never receive cond-duplicated outputs.
+        self.neg_skip_steps = max(
+            0,
+            min(int(neg_skip_steps), max(0, self.stop_caching_offset)),
+        )
+        self.n_calls_neg_skipped = 0
+        self.n_neg_skip_fallbacks = 0
+        self._neg_skip_reasons_logged: set = set()
 
         self._decisions: dict[int, bool] = {}
         self._curr_ws = max(1.0, self.window_size)
@@ -573,6 +592,149 @@ class ChebyCastRuntime:
 
         return forecaster
 
+    # ------------------------------------------------------------------
+    # Negative-prompt skip (tail steps only)
+    # ------------------------------------------------------------------
+
+    def _neg_skip_step(self, step_id: int) -> bool:
+        if self.neg_skip_steps <= 0:
+            return False
+        return step_id >= self.total_steps - self.neg_skip_steps
+
+    def _neg_skip_fallback(self, reason: str) -> None:
+        self.n_neg_skip_fallbacks += 1
+        if reason not in self._neg_skip_reasons_logged:
+            self._neg_skip_reasons_logged.add(reason)
+            _log(
+                1,
+                "negative skip not applied (%s) -> full cond/uncond call"
+                % reason,
+            )
+
+    @staticmethod
+    def _cond_only_kwargs(kwargs_dict: dict):
+        """Build model-function kwargs that contain only the cond chunk.
+
+        Returns (new_kwargs, None) on success or (None, reason) when the
+        call layout is not the simple one-cond / one-uncond batch.
+        """
+        cond_ids = kwargs_dict.get("cond_or_uncond", None)
+        try:
+            cond_ids = [int(value) for value in cond_ids]
+        except Exception:
+            return None, "cond_or_uncond unavailable"
+
+        if len(cond_ids) != 2 or sorted(cond_ids) != [0, 1]:
+            return None, "layout %s is not one cond + one uncond" % (
+                cond_ids,
+            )
+
+        x = kwargs_dict.get("input")
+        timestep = kwargs_dict.get("timestep")
+        if not torch.is_tensor(x) or not torch.is_tensor(timestep):
+            return None, "input or timestep is not a tensor"
+
+        total = int(x.shape[0])
+        if total < 2 or total % 2 != 0:
+            return None, "batch %d cannot be split in two" % total
+
+        chunk = total // 2
+        slot = cond_ids.index(0)
+        start = slot * chunk
+        end = start + chunk
+
+        def _slice(value):
+            if torch.is_tensor(value) and value.ndim > 0 and int(
+                value.shape[0]
+            ) == total:
+                return value[start:end]
+            return value
+
+        if int(timestep.shape[0]) != total:
+            return None, "timestep batch does not match input"
+
+        conditioning = kwargs_dict.get("c", {}) or {}
+        new_c = {}
+
+        for key, value in conditioning.items():
+            if key in ("control", "control_model"):
+                if value is not None:
+                    return None, "ControlNet is active"
+                new_c[key] = value
+                continue
+
+            if key == "transformer_options" and isinstance(value, dict):
+                options = dict(value)
+                options["cond_or_uncond"] = [0]
+
+                uuids = options.get("uuids", None)
+                if isinstance(uuids, (list, tuple)) and len(uuids) == 2:
+                    options["uuids"] = [uuids[slot]]
+
+                # Forge Neo per-row bookkeeping.
+                cond_mark = options.get("cond_mark", None)
+                if torch.is_tensor(cond_mark):
+                    options["cond_mark"] = torch.zeros(
+                        chunk,
+                        dtype=cond_mark.dtype,
+                        device=cond_mark.device,
+                    )
+                if "cond_indices" in options:
+                    options["cond_indices"] = list(range(chunk))
+                if "uncond_indices" in options:
+                    options["uncond_indices"] = []
+
+                new_c[key] = options
+                continue
+
+            if isinstance(value, (list, tuple)):
+                for item in value:
+                    if torch.is_tensor(item) and item.ndim > 0 and int(
+                        item.shape[0]
+                    ) == total:
+                        return None, "batched list in conditioning '%s'" % (
+                            key,
+                        )
+                new_c[key] = value
+                continue
+
+            new_c[key] = _slice(value)
+
+        new_kwargs = dict(kwargs_dict)
+        new_kwargs["input"] = x[start:end]
+        new_kwargs["timestep"] = timestep[start:end]
+        new_kwargs["c"] = new_c
+        new_kwargs["cond_or_uncond"] = [0]
+        return new_kwargs, None
+
+    def _run_cond_only(self, kwargs_dict: dict, actual_fn):
+        """Run the cond chunk only and reuse it for the uncond slot.
+
+        With uncond == cond the CFG combination becomes the cond
+        prediction, and guidance hooks see a zero guidance difference
+        instead of a zero-filled uncond tensor.
+        """
+        new_kwargs, reason = self._cond_only_kwargs(kwargs_dict)
+        if new_kwargs is None:
+            self._neg_skip_fallback(reason)
+            return None
+
+        try:
+            cond_out = actual_fn(new_kwargs)
+        except Exception as error:
+            self._neg_skip_fallback(
+                "cond-only call failed: %s" % type(error).__name__
+            )
+            return None
+
+        chunk = int(new_kwargs["input"].shape[0])
+        if not torch.is_tensor(cond_out) or int(cond_out.shape[0]) != chunk:
+            self._neg_skip_fallback("unexpected cond-only output shape")
+            return None
+
+        self.n_calls_neg_skipped += 1
+        return torch.cat([cond_out, cond_out], dim=0)
+
     def run_call(self, kwargs_dict: dict, actual_fn):
         x = kwargs_dict.get("input")
         timestep = kwargs_dict.get("timestep")
@@ -619,6 +781,13 @@ class ChebyCastRuntime:
             )
 
         if do_actual:
+            if self._neg_skip_step(step_id):
+                output = self._run_cond_only(kwargs_dict, actual_fn)
+                if output is not None:
+                    # Do not feed cond-duplicated outputs to the forecaster.
+                    self.n_calls_actual += 1
+                    return output
+
             output = actual_fn()
 
             if (
@@ -653,6 +822,16 @@ class ChebyCastRuntime:
                 self.coord.source,
             )
         )
+
+        if self.neg_skip_steps > 0:
+            base += (
+                " | neg-skip last=%d calls=%d fallbacks=%d"
+                % (
+                    self.neg_skip_steps,
+                    self.n_calls_neg_skipped,
+                    self.n_neg_skip_fallbacks,
+                )
+            )
 
         histogram: dict[int, int] = {}
         for count in self._calls_per_step.values():
@@ -738,21 +917,25 @@ def apply_chebycast(
         previous = None
 
     def chebycast_wrapper(model_function, kwargs_dict):
-        def _actual():
+        def _actual(call_kwargs=None):
+            # call_kwargs is only passed by the negative-skip path.
+            if call_kwargs is None:
+                call_kwargs = kwargs_dict
+
             if previous is not None:
                 return previous(
                     model_function,
-                    kwargs_dict,
+                    call_kwargs,
                 )
 
-            conditioning = kwargs_dict.get(
+            conditioning = call_kwargs.get(
                 "c",
                 {},
             ) or {}
 
             return model_function(
-                kwargs_dict["input"],
-                kwargs_dict["timestep"],
+                call_kwargs["input"],
+                call_kwargs["timestep"],
                 **conditioning,
             )
 
